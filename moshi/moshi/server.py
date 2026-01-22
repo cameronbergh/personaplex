@@ -370,6 +370,7 @@ def main():
                         help="HF repo to look into, defaults PersonaPlex. "
                              "Use this to select a different pre-trained model.")
     parser.add_argument("--device", type=str, default="cuda", help="Device on which to run, defaults to 'cuda'.")
+    parser.add_argument("--devices", type=str, default=None, help="Comma separated list of devices to use for the model. Overrides --device.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -402,7 +403,17 @@ def main():
     assert static_path is None or os.path.exists(static_path), \
         f"Static path does not exist: {static_path}."
     logger.info(f"static_path = {static_path}")
-    args.device = torch_auto_device(args.device)
+
+    if args.devices:
+        devices = [torch.device(d) for d in args.devices.split(",")]
+        args.device = devices[0]
+    else:
+        args.device = torch_auto_device(args.device)
+        devices = None
+        if args.device.type == "cuda" and torch.cuda.device_count() > 1:
+            logger.info("Multiple GPUs detected, using all of them.")
+            devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
+            args.device = devices[0]
 
     seed_all(42424242)
 
@@ -439,7 +450,7 @@ def main():
     logger.info("loading moshi")
     if args.moshi_weight is None:
         args.moshi_weight = hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
-    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device)
+    lm = loaders.get_moshi_lm(args.moshi_weight, device=args.device, devices=devices)
     lm.eval()
     logger.info("moshi loaded")
     state = ServerState(

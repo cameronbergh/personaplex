@@ -164,6 +164,7 @@ def get_moshi_lm(
     filename: str | Path | None,
     copy_missing_weights: bool = True,
     device: torch.device | str = "cpu",
+    devices: list[str | torch.device] | None = None,
     dtype: torch.dtype = torch.bfloat16,
     delays=None,
 ) -> LMModel:
@@ -173,7 +174,11 @@ def get_moshi_lm(
     if delays is not None:
         lm_kwargs["delays"] = delays
 
-    model = LMModel(device=device, dtype=dtype, **lm_kwargs).to(device=device, dtype=dtype)
+    if devices is not None:
+        model = LMModel(device=device, devices=devices, dtype=dtype, **lm_kwargs)
+        # We don't move to device globaly as we have split the model
+    else:
+        model = LMModel(device=device, dtype=dtype, **lm_kwargs).to(device=device, dtype=dtype)
 
     if filename is None:
         model.eval()
@@ -229,7 +234,8 @@ def get_moshi_lm(
             if not replaced:
                 print("Missing %s", name)
 
-    model.load_state_dict(state_dict, strict=False, assign=True)
-    model.to(device)
+    model.load_state_dict(state_dict, strict=False, assign=devices is None)
+    if devices is None:
+        model.to(device)
     model.eval()
     return model

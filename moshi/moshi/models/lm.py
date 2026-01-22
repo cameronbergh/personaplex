@@ -261,6 +261,7 @@ class LMModel(StreamingContainer):
         existing_text_padding_id: Optional[int] = None,
         context: Optional[int] = None,
         device=None,
+        devices: Optional[List[Union[str, torch.device]]] = None,
         dtype=None,
         **kwargs,
     ):
@@ -278,10 +279,20 @@ class LMModel(StreamingContainer):
         if depformer_weights_per_step_schedule is not None:
             assert len(depformer_weights_per_step_schedule) == dep_q
         kwargs["context"] = context
+
+        if devices is None:
+            if device is not None:
+                devices = [device]
+            else:
+                devices = [None]
+
+        first_device = devices[0]
+        last_device = devices[-1]
+
         EmbeddingFactory = partial(
             ScaledEmbedding,
             norm=norm_emb,
-            device=device,
+            device=first_device,
             dtype=dtype,
             zero_idx=self.zero_token_id,
         )
@@ -293,7 +304,7 @@ class LMModel(StreamingContainer):
         extra_text = self.existing_text_padding_id is None
         # Unlike for audio, here we authorize the model to output the special token.
         self.text_emb = EmbeddingFactory(text_card + 1, dim)
-        self.text_linear = torch.nn.Linear(dim, text_card + extra_text, bias=bias_proj)
+        self.text_linear = torch.nn.Linear(dim, text_card + extra_text, bias=bias_proj, device=last_device, dtype=dtype)
         depformer_prefix = "depformer_"
         main_kwargs = {
             k: v for k, v in kwargs.items() if not k.startswith(depformer_prefix)
@@ -304,10 +315,11 @@ class LMModel(StreamingContainer):
             dim_feedforward=int(hidden_scale * dim),
             norm=norm,
             device=device,
+            devices=devices,
             dtype=dtype,
             **main_kwargs,
         )
-        self.out_norm = create_norm_fn(norm, dim)
+        self.out_norm = create_norm_fn(norm, dim, device=last_device, dtype=dtype)
         self.depformer_multi_linear = depformer_multi_linear
         kwargs_dep = main_kwargs.copy()
         kwargs_dep.update(
@@ -324,24 +336,33 @@ class LMModel(StreamingContainer):
         if depformer_multi_linear:
             # One linear layer per codebook to project different informations from the main model.
             self.depformer_in = torch.nn.ModuleList(
-                [torch.nn.Linear(dim, depformer_dim, bias=False) for _ in range(dep_q)]
+                [torch.nn.Linear(dim, depformer_dim, bias=False, device=last_device, dtype=dtype) for _ in range(dep_q)]
             )
         else:
             self.depformer_in = torch.nn.ModuleList(
-                [torch.nn.Linear(dim, depformer_dim, bias=False)]
+                [torch.nn.Linear(dim, depformer_dim, bias=False, device=last_device, dtype=dtype)]
             )
+
+        DepformerEmbeddingFactory = partial(
+            ScaledEmbedding,
+            norm=norm_emb,
+            device=last_device,
+            dtype=dtype,
+            zero_idx=self.zero_token_id,
+        )
+
         # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
         self.depformer_emb = torch.nn.ModuleList(
-            [EmbeddingFactory(self.card + 1, depformer_dim) for _ in range(dep_q - 1)]
+            [DepformerEmbeddingFactory(self.card + 1, depformer_dim) for _ in range(dep_q - 1)]
         )
-        self.depformer_text_emb = EmbeddingFactory(text_card + 1, depformer_dim)
+        self.depformer_text_emb = DepformerEmbeddingFactory(text_card + 1, depformer_dim)
         if depformer_dim_feedforward is None:
             depformer_dim_feedforward = int(hidden_scale * depformer_dim)
         self.depformer = StreamingTransformer(
             d_model=depformer_dim,
             dim_feedforward=depformer_dim_feedforward,
             norm=norm,
-            device=device,
+            device=last_device,
             dtype=dtype,
             **kwargs_dep,
         )
@@ -349,7 +370,7 @@ class LMModel(StreamingContainer):
         dim = depformer_dim  # we will directly apply the next linears to the output of the Depformer.
 
         self.linears = torch.nn.ModuleList(
-            [torch.nn.Linear(dim, self.card, bias=bias_proj) for _ in range(dep_q)]
+            [torch.nn.Linear(dim, self.card, bias=bias_proj, device=last_device, dtype=dtype) for _ in range(dep_q)]
         )
 
     @property
@@ -715,7 +736,8 @@ class LMGen(StreamingModule[_LMGenState]):
             dtype=torch.bool
         )
 
-        disable = lm_model.device.type != 'cuda'
+        devices = {p.device for p in lm_model.parameters()}
+        disable = lm_model.device.type != 'cuda' or len(devices) > 1
         # disable = True # DEBUG
         graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
@@ -889,25 +911,36 @@ class LMGen(StreamingModule[_LMGenState]):
         assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
-        next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
+        # Handle potential device mismatch (if model is split across GPUs)
+        # provided_ and target_ are slices of state.cache (usually on first device)
+        # sampled_text_token is on last device
+        target_text_on_device = target_[:, 0, 0].to(sampled_text_token.device)
+        provided_text_on_device = provided_[:, 0, 0].to(sampled_text_token.device)
+        next_text_token = torch.where(provided_text_on_device, target_text_on_device, sampled_text_token)
+
+        target_audio_on_device = target_[:,lm_model.audio_offset:,0].to(sampled_text_token.device)
+        provided_audio_on_device = provided_[:,lm_model.audio_offset:,0].to(sampled_text_token.device)
 
         if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_audio_on_device, provided_audio_on_device) # [B, K_audio, Card_audio]
         else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_audio_on_device, provided_audio_on_device)
 
         state.provided[:, :, model_input_position] = False
         ####
         # Fill cache with generated tokens at state.offset (where not provided)
 
+        sampled_text_token_cache = sampled_text_token.to(state.cache.device)
+        sampled_audio_tokens_cache = sampled_audio_tokens.to(state.cache.device)
+
         state.cache[:, 0, target_position] = torch.where(
             ~state.provided[:, 0, target_position],
-            sampled_text_token,
+            sampled_text_token_cache,
             state.cache[:, 0, target_position],
         )
         state.cache[:, 1 : lm_model.dep_q + 1, target_position] = torch.where(
             ~state.provided[:, 1 : lm_model.dep_q + 1, target_position],
-            sampled_audio_tokens,
+            sampled_audio_tokens_cache,
             state.cache[:, 1 : lm_model.dep_q + 1, target_position],
         )
 
