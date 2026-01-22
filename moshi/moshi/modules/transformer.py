@@ -660,6 +660,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
         layer_class: tp.Type[StreamingTransformerLayer] = StreamingTransformerLayer,
         device=None,
         dtype=None,
+        devices: tp.Optional[tp.List[torch.device | str]] = None,
         **kwargs,
     ):
         super().__init__()
@@ -676,7 +677,17 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             self.rope = RotaryEmbedding(max_period=max_period)
 
         self.layers = nn.ModuleList()
-        for _ in range(num_layers):
+        if devices is None:
+            devices = [device] * num_layers
+
+        for i in range(num_layers):
+            layer_device = devices[i % len(devices)]
+            # If there are more devices than layers, we might loop back, but that's unlikely
+            # A better distribution for len(devices) < num_layers:
+            if len(devices) > 1 and len(devices) <= num_layers:
+                layers_per_device = (num_layers + len(devices) - 1) // len(devices)
+                layer_device = devices[i // layers_per_device]
+
             self.layers.append(
                 layer_class(
                     d_model=d_model,
@@ -685,7 +696,7 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                     causal=causal,
                     context=context,
                     rope=self.rope,
-                    device=device,
+                    device=layer_device,
                     dtype=dtype,
                     **kwargs,
                 )
@@ -713,6 +724,9 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             x = x + self.positional_scale * pos_emb
 
         for layer in self.layers:
+            device = next(layer.parameters()).device
+            if x.device != device:
+                x = x.to(device)
             x = layer(x, *args, **kwargs)
 
         if state is not None:
