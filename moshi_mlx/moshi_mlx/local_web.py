@@ -146,7 +146,15 @@ def model_server(client_to_server, server_to_client, lm_config, args):
         nn.quantize(model, bits=args.quantized, group_size=group_size)
 
     log("info", f"[SERVER] loading weights {model_file}")
-    model.load_weights(model_file, strict=True)
+    try:
+        model.load_weights(model_file, strict=True)
+    except Exception as e:
+        log("info", f"[SERVER] Standard load_weights failed, trying load_pytorch_weights: {e}")
+        try:
+            model.load_pytorch_weights(model_file, lm_config, strict=True)
+        except Exception as e2:
+            log("info", f"[SERVER] load_pytorch_weights also failed: {e2}")
+            raise e
     log("info", "[SERVER] weights loaded")
 
     if model.condition_provider is not None:
