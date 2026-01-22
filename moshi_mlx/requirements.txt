@@ -1,0 +1,8 @@
+mlx
+sentencepiece
+huggingface_hub
+sounddevice
+numpy
+rustymimi
+sphn
+pyloudnorm
